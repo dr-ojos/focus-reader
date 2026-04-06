@@ -5,6 +5,7 @@ import {
   parsePdf, parseEpub, buildParagraphsFromText, buildParagraphsFromBlocks,
   type Paragraph,
 } from "@/lib/parsers";
+import { computeWordDurations } from "@/lib/wordTiming";
 import styles from "./FocusReader.module.css";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -30,12 +31,23 @@ export default function FocusReader() {
   const [darkMode, setDarkMode]       = useState(true);
   const [showChapters, setShowChapters] = useState(false);
 
-  const timerRef     = useRef<ReturnType<typeof setInterval> | null>(null);
-  const wordRefs     = useRef<(HTMLSpanElement | null)[]>([]);
-  const containerRef = useRef<HTMLDivElement>(null);
+  const timerRef      = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const wordRefs      = useRef<(HTMLSpanElement | null)[]>([]);
+  const containerRef  = useRef<HTMLDivElement>(null);
+  // Always-fresh refs for use inside setTimeout closures
+  const isPlayingRef  = useRef(isPlaying);
+  const wordsLenRef   = useRef(words.length);
+  const durationsRef  = useRef<number[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const msPerWord = (60 / wpm) * 1000;
+  // Keep refs in sync with state
+  useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
+  useEffect(() => { wordsLenRef.current = words.length; }, [words.length]);
+
+  // Recompute adaptive durations whenever words, paragraphs or wpm change
+  useEffect(() => {
+    durationsRef.current = computeWordDurations(words, paragraphs, wpm);
+  }, [words, paragraphs, wpm]);
 
   // ── Derived: current paragraph index ─────────────────────────────────────
   const currentParaIdx = useMemo(
@@ -80,20 +92,34 @@ export default function FocusReader() {
       setProgress(Math.round((currentIdx / (words.length - 1)) * 100));
   }, [currentIdx, words.length]);
 
-  // ── Playback engine ──────────────────────────────────────────────────────
+  // ── Adaptive playback engine (variable timing per word) ─────────────────
   useEffect(() => {
-    if (isPlaying) {
-      timerRef.current = setInterval(() => {
-        setCurrentIdx((prev) => {
-          if (prev >= words.length - 1) { setIsPlaying(false); return prev; }
-          return prev + 1;
-        });
-      }, msPerWord);
-    } else {
-      if (timerRef.current) clearInterval(timerRef.current);
+    if (!isPlaying) {
+      if (timerRef.current) clearTimeout(timerRef.current);
+      return;
     }
-    return () => { if (timerRef.current) clearInterval(timerRef.current); };
-  }, [isPlaying, msPerWord, words.length]);
+
+    // Recursive scheduler: reads durationsRef each tick so WPM changes
+    // take effect immediately without restarting the whole effect.
+    const scheduleNext = (fromIdx: number) => {
+      const delay = durationsRef.current[fromIdx] ?? (60 / wpm) * 1000;
+      timerRef.current = setTimeout(() => {
+        setCurrentIdx((prev) => {
+          if (prev >= wordsLenRef.current - 1) {
+            setIsPlaying(false);
+            return prev;
+          }
+          const next = prev + 1;
+          scheduleNext(next);
+          return next;
+        });
+      }, delay);
+    };
+
+    scheduleNext(currentIdx);
+    return () => { if (timerRef.current) clearTimeout(timerRef.current); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlaying]);
 
   // ── Speed ─────────────────────────────────────────────────────────────────
   const setSpeed = useCallback((val: number) => {
