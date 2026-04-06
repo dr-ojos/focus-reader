@@ -29,40 +29,165 @@ export const loadJSZip = (): Promise<void> =>
     () => !!(window as any).JSZip
   );
 
-// ---------- Helpers ----------
+// ---------- Types ----------
 
-/** Strip HTML → clean plain text preserving paragraph breaks */
-export const htmlToText = (html: string): string => {
+export type BlockType = "h1" | "h2" | "h3" | "h4" | "body";
+
+export interface Block {
+  text: string;
+  type: BlockType;
+}
+
+export interface Paragraph {
+  startIdx: number;
+  endIdx: number;
+  type: BlockType;
+}
+
+// ---------- HTML → Blocks (preserves heading hierarchy) ----------
+
+export const htmlToBlocks = (html: string): Block[] => {
   const doc = new DOMParser().parseFromString(html, "text/html");
   doc.querySelectorAll("script,style,nav,aside").forEach((n) => n.remove());
-  doc.querySelectorAll("p,div,br,h1,h2,h3,h4,h5,h6,li").forEach((n) => {
-    n.insertAdjacentText("afterend", "\n\n");
-  });
-  return ((doc.body as HTMLElement)?.innerText || doc.body?.textContent || "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
+
+  const typeMap: Record<string, BlockType> = {
+    h1: "h1", h2: "h2", h3: "h3", h4: "h4", h5: "h4", h6: "h4",
+  };
+
+  const blocks: Block[] = [];
+  const seen = new WeakSet<Element>();
+
+  const collect = (el: Element) => {
+    if (seen.has(el)) return;
+    seen.add(el);
+    const tag = el.tagName?.toLowerCase();
+    if (!tag) return;
+
+    if (typeMap[tag]) {
+      const text = (el.textContent || "").trim();
+      if (text.length > 0) blocks.push({ text, type: typeMap[tag] });
+    } else if (tag === "p" || tag === "li") {
+      if (!el.querySelector("h1,h2,h3,h4,h5,h6")) {
+        const text = (el.textContent || "").trim();
+        if (text.length > 0) {
+          blocks.push({ text, type: "body" });
+          el.querySelectorAll("*").forEach((c) => seen.add(c));
+        }
+      } else {
+        Array.from(el.children).forEach(collect);
+      }
+    } else {
+      Array.from(el.children).forEach(collect);
+    }
+  };
+
+  Array.from(doc.body?.children || []).forEach(collect);
+  return blocks;
 };
 
 // ---------- Parsers ----------
 
-export async function parsePdf(arrayBuffer: ArrayBuffer): Promise<string> {
+export async function parsePdf(
+  arrayBuffer: ArrayBuffer
+): Promise<{ words: string[]; paragraphs: Paragraph[] }> {
   const pdfjs = await loadPdfJs();
   const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
-  let fullText = "";
-  for (let i = 1; i <= pdf.numPages; i++) {
-    const page = await pdf.getPage(i);
+
+  interface RawItem { str: string; fontSize: number; y: number; }
+  const allItems: RawItem[] = [];
+
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
+    const viewport = page.getViewport({ scale: 1 });
     const content = await page.getTextContent();
-    fullText += content.items.map((item: any) => item.str).join(" ") + "\n\n";
+    const pageH: number = viewport.height;
+
+    content.items.forEach((item: any) => {
+      const str = (item.str || "").trim();
+      if (!str) return;
+      const t = item.transform;
+      const fontSize = Math.abs(t[3]) || Math.abs(t[0]) || 12;
+      const y = (pageH - t[5]) + (pageNum - 1) * (pageH + 100);
+      allItems.push({ str, fontSize, y });
+    });
   }
-  return fullText.trim();
+
+  if (!allItems.length) return { words: [], paragraphs: [] };
+  allItems.sort((a, b) => a.y - b.y);
+
+  // Group into visual lines by y proximity
+  const lines: Array<{ text: string; fontSize: number; y: number }> = [];
+  let lineItems: RawItem[] = [allItems[0]];
+
+  for (let i = 1; i < allItems.length; i++) {
+    if (Math.abs(allItems[i].y - lineItems[0].y) <= 4) {
+      lineItems.push(allItems[i]);
+    } else {
+      const text = lineItems.map((x) => x.str).join(" ").trim();
+      const avgSize = lineItems.reduce((s, x) => s + x.fontSize, 0) / lineItems.length;
+      if (text) lines.push({ text, fontSize: avgSize, y: lineItems[0].y });
+      lineItems = [allItems[i]];
+    }
+  }
+  {
+    const text = lineItems.map((x) => x.str).join(" ").trim();
+    const avgSize = lineItems.reduce((s, x) => s + x.fontSize, 0) / lineItems.length;
+    if (text) lines.push({ text, fontSize: avgSize, y: lineItems[0].y });
+  }
+
+  // Median font size → heading thresholds
+  const sortedSizes = [...lines.map((l) => l.fontSize)].sort((a, b) => a - b);
+  const median = sortedSizes[Math.floor(sortedSizes.length / 2)] || 12;
+
+  const gaps = lines
+    .slice(1)
+    .map((l, i) => l.y - lines[i].y)
+    .filter((g) => g > 0 && g < 100);
+  const avgGap = gaps.length
+    ? gaps.reduce((s, g) => s + g, 0) / gaps.length
+    : 20;
+
+  // Build blocks
+  const blocks: Block[] = [];
+  let bodyLines: string[] = [];
+
+  const flushBody = () => {
+    if (bodyLines.length) {
+      blocks.push({ text: bodyLines.join(" "), type: "body" });
+      bodyLines = [];
+    }
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const { text, fontSize, y } = lines[i];
+    const gap = i > 0 ? y - lines[i - 1].y : 0;
+    const isParaBreak = i > 0 && gap > avgGap * 1.6;
+
+    let type: BlockType = "body";
+    if (fontSize >= median * 1.7) type = "h1";
+    else if (fontSize >= median * 1.35) type = "h2";
+    else if (fontSize >= median * 1.15) type = "h3";
+
+    if (type !== "body") {
+      flushBody();
+      blocks.push({ text, type });
+    } else {
+      if (isParaBreak) flushBody();
+      bodyLines.push(text);
+    }
+  }
+  flushBody();
+
+  return buildParagraphsFromBlocks(blocks);
 }
 
-export async function parseEpub(arrayBuffer: ArrayBuffer): Promise<string> {
+export async function parseEpub(
+  arrayBuffer: ArrayBuffer
+): Promise<{ words: string[]; paragraphs: Paragraph[] }> {
   await loadJSZip();
   const JSZip = (window as any).JSZip;
   const zip = await JSZip.loadAsync(arrayBuffer);
 
-  // 1. Find OPF via META-INF/container.xml
   let opfPath = "";
   try {
     const containerXml: string = await zip.file("META-INF/container.xml").async("text");
@@ -70,7 +195,6 @@ export async function parseEpub(arrayBuffer: ArrayBuffer): Promise<string> {
     if (match) opfPath = match[1];
   } catch {}
 
-  // 2. Parse OPF → spine order
   let spineFiles: string[] = [];
   if (opfPath) {
     try {
@@ -79,14 +203,12 @@ export async function parseEpub(arrayBuffer: ArrayBuffer): Promise<string> {
       const opfBase = opfPath.includes("/")
         ? opfPath.substring(0, opfPath.lastIndexOf("/") + 1)
         : "";
-
       const manifest: Record<string, string> = {};
       opfDoc.querySelectorAll("manifest item").forEach((item) => {
         const id = item.getAttribute("id");
         const href = item.getAttribute("href");
         if (id && href) manifest[id] = href;
       });
-
       opfDoc.querySelectorAll("spine itemref").forEach((ref) => {
         const idref = ref.getAttribute("idref");
         if (idref && manifest[idref]) spineFiles.push(opfBase + manifest[idref]);
@@ -94,7 +216,6 @@ export async function parseEpub(arrayBuffer: ArrayBuffer): Promise<string> {
     } catch {}
   }
 
-  // Fallback: all xhtml/html files sorted
   if (spineFiles.length === 0) {
     spineFiles = Object.keys(zip.files)
       .filter(
@@ -106,56 +227,69 @@ export async function parseEpub(arrayBuffer: ArrayBuffer): Promise<string> {
       .sort();
   }
 
-  // 3. Extract text from each spine file
-  const parts: string[] = [];
+  const allBlocks: Block[] = [];
   for (const filePath of spineFiles) {
     const fileObj = zip.file(filePath) || zip.file(decodeURIComponent(filePath));
     if (!fileObj) continue;
     try {
       const html: string = await fileObj.async("text");
-      const chunk = htmlToText(html);
-      if (chunk.length > 20) parts.push(chunk);
+      const blocks = htmlToBlocks(html);
+      if (blocks.length > 0) allBlocks.push(...blocks);
     } catch {}
   }
 
-  return parts.join("\n\n");
+  if (allBlocks.length === 0) return { words: [], paragraphs: [] };
+  return buildParagraphsFromBlocks(allBlocks);
 }
 
-// ---------- Text → Paragraph model ----------
+// ---------- TXT → structured blocks ----------
 
-export interface Paragraph {
-  startIdx: number;
-  endIdx: number;
-}
-
-export function buildParagraphs(text: string): {
+export function buildParagraphsFromText(text: string): {
   words: string[];
   paragraphs: Paragraph[];
 } {
-  const rawParas = text
-    .split(/\n\s*\n|\r\n\s*\r\n/)
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0);
+  const lines = text.split("\n");
+  const blocks: Block[] = [];
+  let bodyBuffer: string[] = [];
 
+  const flushBody = () => {
+    const t = bodyBuffer.join(" ").trim();
+    if (t.length > 0) blocks.push({ text: t, type: "body" });
+    bodyBuffer = [];
+  };
+
+  for (const line of lines) {
+    const t = line.trim();
+    if (t.startsWith("### ")) { flushBody(); blocks.push({ text: t.slice(4), type: "h3" }); }
+    else if (t.startsWith("## ")) { flushBody(); blocks.push({ text: t.slice(3), type: "h2" }); }
+    else if (t.startsWith("# "))  { flushBody(); blocks.push({ text: t.slice(2), type: "h1" }); }
+    else if (t === "")            { flushBody(); }
+    else                          { bodyBuffer.push(t); }
+  }
+  flushBody();
+
+  return buildParagraphsFromBlocks(blocks);
+}
+
+// ---------- Core builder ----------
+
+export function buildParagraphsFromBlocks(blocks: Block[]): {
+  words: string[];
+  paragraphs: Paragraph[];
+} {
   const allWords: string[] = [];
   const paraMap: Paragraph[] = [];
-
-  if (rawParas.length > 1) {
-    rawParas.forEach((para) => {
-      const pWords = para.split(/\s+/).filter((w) => w.length > 0);
-      if (!pWords.length) return;
-      const start = allWords.length;
-      allWords.push(...pWords);
-      paraMap.push({ startIdx: start, endIdx: allWords.length - 1 });
-    });
-  } else {
-    const flat = text.split(/\s+/).filter((w) => w.length > 0);
-    allWords.push(...flat);
-    const CHUNK = 10;
-    for (let i = 0; i < flat.length; i += CHUNK) {
-      paraMap.push({ startIdx: i, endIdx: Math.min(i + CHUNK - 1, flat.length - 1) });
-    }
+  for (const block of blocks) {
+    const bWords = block.text.split(/\s+/).filter((w) => w.length > 0);
+    if (!bWords.length) continue;
+    const start = allWords.length;
+    allWords.push(...bWords);
+    paraMap.push({ startIdx: start, endIdx: allWords.length - 1, type: block.type });
   }
-
   return { words: allWords, paragraphs: paraMap };
+}
+
+// Backward-compat alias used for error messages
+export function buildParagraphs(text: string) {
+  return buildParagraphsFromText(text);
 }
