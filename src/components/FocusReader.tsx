@@ -34,17 +34,19 @@ export default function FocusReader() {
   const timerRef      = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wordRefs      = useRef<(HTMLSpanElement | null)[]>([]);
   const containerRef  = useRef<HTMLDivElement>(null);
-  // Always-fresh refs for use inside setTimeout closures
+  // Always-fresh refs — safe to read inside setTimeout without stale closures
   const isPlayingRef  = useRef(isPlaying);
   const wordsLenRef   = useRef(words.length);
+  const currentIdxRef = useRef(0);
   const durationsRef  = useRef<number[]>([]);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const fileInputRef  = useRef<HTMLInputElement>(null);
 
   // Keep refs in sync with state
-  useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
-  useEffect(() => { wordsLenRef.current = words.length; }, [words.length]);
+  useEffect(() => { isPlayingRef.current  = isPlaying;    }, [isPlaying]);
+  useEffect(() => { wordsLenRef.current   = words.length; }, [words.length]);
+  useEffect(() => { currentIdxRef.current = currentIdx;  }, [currentIdx]);
 
-  // Recompute adaptive durations whenever words, paragraphs or wpm change
+  // Recompute adaptive durations whenever words, paragraphs or WPM change
   useEffect(() => {
     durationsRef.current = computeWordDurations(words, paragraphs, wpm);
   }, [words, paragraphs, wpm]);
@@ -92,32 +94,46 @@ export default function FocusReader() {
       setProgress(Math.round((currentIdx / (words.length - 1)) * 100));
   }, [currentIdx, words.length]);
 
-  // ── Adaptive playback engine (variable timing per word) ─────────────────
+  // ── Adaptive playback engine ─────────────────────────────────────────────
+  // IMPORTANT: scheduleNext must NEVER be called inside a setState updater,
+  // because React Strict Mode invokes updaters twice, causing exponential timeouts.
   useEffect(() => {
     if (!isPlaying) {
       if (timerRef.current) clearTimeout(timerRef.current);
       return;
     }
 
-    // Recursive scheduler: reads durationsRef each tick so WPM changes
-    // take effect immediately without restarting the whole effect.
-    const scheduleNext = (fromIdx: number) => {
-      const delay = durationsRef.current[fromIdx] ?? (60 / wpm) * 1000;
+    // `cancelled` flag ensures the old chain stops even if a timeout
+    // fires between effect teardown and the next Strict Mode re-mount.
+    let cancelled = false;
+
+    const scheduleNext = () => {
+      if (cancelled || !isPlayingRef.current) return;
+
+      const idx   = currentIdxRef.current;
+      const delay = durationsRef.current[idx] ?? (60 / wpm) * 1000;
+
       timerRef.current = setTimeout(() => {
-        setCurrentIdx((prev) => {
-          if (prev >= wordsLenRef.current - 1) {
-            setIsPlaying(false);
-            return prev;
-          }
-          const next = prev + 1;
-          scheduleNext(next);
-          return next;
-        });
+        if (cancelled || !isPlayingRef.current) return;
+
+        const cur = currentIdxRef.current;
+        if (cur >= wordsLenRef.current - 1) {
+          setIsPlaying(false);
+          return;
+        }
+
+        // Advance word (pure state update — no side effects inside)
+        setCurrentIdx(cur + 1);
+        // Schedule next OUTSIDE of setState
+        scheduleNext();
       }, delay);
     };
 
-    scheduleNext(currentIdx);
-    return () => { if (timerRef.current) clearTimeout(timerRef.current); };
+    scheduleNext();
+    return () => {
+      cancelled = true;
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isPlaying]);
 
