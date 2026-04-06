@@ -2,10 +2,11 @@
 
 import { Fragment, useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
-  parsePdf, parseEpub, buildParagraphsFromText, buildParagraphsFromBlocks,
+  parsePdf, parseEpub, buildParagraphsFromText,
   type Paragraph,
 } from "@/lib/parsers";
 import { computeWordDurations } from "@/lib/wordTiming";
+import { buildChunks, findChunkForWord, bionicSplit, type Chunk } from "@/lib/chunker";
 import styles from "./FocusReader.module.css";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -14,55 +15,68 @@ const MAX_WPM = 800;
 const FONT_SIZE_LABELS = ["S", "M", "L", "XL"];
 const FONT_SIZE_VALUES = ["1rem", "1.125rem", "1.3rem", "1.6rem"];
 
+// ─── Bionic word renderer (inline helper) ────────────────────────────────────
+function BionicWord({ word, className }: { word: string; className?: string }) {
+  const [bold, normal] = bionicSplit(word);
+  return (
+    <span className={className}>
+      <strong className={styles.bionicBold}>{bold}</strong>{normal}
+    </span>
+  );
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 export default function FocusReader() {
-  const [words, setWords]             = useState<string[]>([]);
-  const [paragraphs, setParagraphs]   = useState<Paragraph[]>([]);
-  const [currentIdx, setCurrentIdx]   = useState(0);
-  const [isPlaying, setIsPlaying]     = useState(false);
-  const [wpm, setWpm]                 = useState(250);
-  const [wpmInput, setWpmInput]       = useState("250");
-  const [fontSizeIdx, setFontSizeIdx] = useState(1);
-  const [fileName, setFileName]       = useState("");
-  const [loading, setLoading]         = useState(false);
-  const [loadingMsg, setLoadingMsg]   = useState("Procesando…");
-  const [mode, setMode]               = useState<"scroll" | "spritz">("scroll");
-  const [progress, setProgress]       = useState(0);
-  const [darkMode, setDarkMode]       = useState(true);
+  // ── Core state ────────────────────────────────────────────────────────────
+  const [words, setWords]               = useState<string[]>([]);
+  const [paragraphs, setParagraphs]     = useState<Paragraph[]>([]);
+  const [currentChunkIdx, setCurrentChunkIdx] = useState(0);
+  const [isPlaying, setIsPlaying]       = useState(false);
+  const [wpm, setWpm]                   = useState(250);
+  const [wpmInput, setWpmInput]         = useState("250");
+  const [fontSizeIdx, setFontSizeIdx]   = useState(1);
+  const [fileName, setFileName]         = useState("");
+  const [loading, setLoading]           = useState(false);
+  const [loadingMsg, setLoadingMsg]     = useState("Procesando…");
+  const [mode, setMode]                 = useState<"scroll" | "spritz">("scroll");
+  const [progress, setProgress]         = useState(0);
+  const [darkMode, setDarkMode]         = useState(true);
   const [showChapters, setShowChapters] = useState(false);
+  // Humanized reading options
+  const [chunkSize, setChunkSize]       = useState(2);   // words per display group
+  const [bionicMode, setBionicMode]     = useState(false);
 
-  const timerRef      = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const wordRefs      = useRef<(HTMLSpanElement | null)[]>([]);
-  const containerRef  = useRef<HTMLDivElement>(null);
-  // Always-fresh refs — safe to read inside setTimeout without stale closures
-  const isPlayingRef  = useRef(isPlaying);
-  const wordsLenRef   = useRef(words.length);
-  const currentIdxRef = useRef(0);
-  const durationsRef  = useRef<number[]>([]);
-  const fileInputRef  = useRef<HTMLInputElement>(null);
+  // ── Refs ──────────────────────────────────────────────────────────────────
+  const timerRef           = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const wordRefs           = useRef<(HTMLSpanElement | null)[]>([]);
+  const containerRef       = useRef<HTMLDivElement>(null);
+  const fileInputRef       = useRef<HTMLInputElement>(null);
+  const isPlayingRef       = useRef(isPlaying);
+  const chunksLenRef       = useRef(0);
+  const currentChunkIdxRef = useRef(0);
+  const durationsRef       = useRef<number[]>([]);
+  const chunkDurationsRef  = useRef<number[]>([]);
 
-  // Keep refs in sync with state
-  useEffect(() => { isPlayingRef.current  = isPlaying;    }, [isPlaying]);
-  useEffect(() => { wordsLenRef.current   = words.length; }, [words.length]);
-  useEffect(() => { currentIdxRef.current = currentIdx;  }, [currentIdx]);
+  // ── Derived: chunks ───────────────────────────────────────────────────────
+  const chunks = useMemo(
+    () => buildChunks(words, paragraphs, chunkSize),
+    [words, paragraphs, chunkSize]
+  );
 
-  // Recompute adaptive durations whenever words, paragraphs or WPM change
-  useEffect(() => {
-    durationsRef.current = computeWordDurations(words, paragraphs, wpm);
-  }, [words, paragraphs, wpm]);
+  // ── Derived: current word range ───────────────────────────────────────────
+  const currentChunk     = chunks[currentChunkIdx] ?? { startIdx: 0, endIdx: 0 };
+  const currentWordStart = currentChunk.startIdx;
+  const currentWordEnd   = currentChunk.endIdx;
 
   // ── Derived: current paragraph index ─────────────────────────────────────
   const currentParaIdx = useMemo(
-    () => paragraphs.findIndex((p) => currentIdx >= p.startIdx && currentIdx <= p.endIdx),
-    [currentIdx, paragraphs]
+    () => paragraphs.findIndex((p) => currentWordStart >= p.startIdx && currentWordStart <= p.endIdx),
+    [currentWordStart, paragraphs]
   );
 
-  // ── Derived: chapters list (h1 + h2) ─────────────────────────────────────
+  // ── Derived: chapters (h1 + h2) ──────────────────────────────────────────
   const chapters = useMemo(
-    () =>
-      paragraphs
-        .map((p, idx) => ({ ...p, paraIdx: idx }))
-        .filter((p) => p.type === "h1" || p.type === "h2"),
+    () => paragraphs.map((p, idx) => ({ ...p, paraIdx: idx })).filter((p) => p.type === "h1" || p.type === "h2"),
     [paragraphs]
   );
 
@@ -70,61 +84,72 @@ export default function FocusReader() {
   const currentChapterLabel = useMemo(() => {
     for (let i = currentParaIdx; i >= 0; i--) {
       const p = paragraphs[i];
-      if (p && (p.type === "h1" || p.type === "h2")) {
+      if (p && (p.type === "h1" || p.type === "h2"))
         return words.slice(p.startIdx, p.endIdx + 1).join(" ");
-      }
     }
     return "";
   }, [currentParaIdx, paragraphs, words]);
 
+  // ── Sync refs ─────────────────────────────────────────────────────────────
+  useEffect(() => { isPlayingRef.current       = isPlaying;         }, [isPlaying]);
+  useEffect(() => { chunksLenRef.current        = chunks.length;     }, [chunks.length]);
+  useEffect(() => { currentChunkIdxRef.current  = currentChunkIdx;   }, [currentChunkIdx]);
+
+  // ── Compute adaptive timings ──────────────────────────────────────────────
+  useEffect(() => {
+    const wordDurs = computeWordDurations(words, paragraphs, wpm);
+    durationsRef.current = wordDurs;
+
+    const baseMs = (60 / wpm) * 1000;
+    chunkDurationsRef.current = chunks.map((chunk) => {
+      let maxDur = baseMs;
+      for (let i = chunk.startIdx; i <= chunk.endIdx; i++) {
+        const d = wordDurs[i] ?? baseMs;
+        if (d > maxDur) maxDur = d;
+      }
+      const count = chunk.endIdx - chunk.startIdx + 1;
+      // Each additional simultaneous word adds ~35% to display time
+      return maxDur * (count === 1 ? 1.0 : 1 + (count - 1) * 0.35);
+    });
+  }, [words, paragraphs, wpm, chunks]);
+
   // ── Auto-scroll ──────────────────────────────────────────────────────────
   useEffect(() => {
     if (mode !== "scroll") return;
-    const el = wordRefs.current[currentIdx];
+    const el = wordRefs.current[currentWordStart];
     if (el && containerRef.current) {
-      const container = containerRef.current;
-      const targetScroll = el.offsetTop - container.clientHeight / 2 + el.offsetHeight / 2;
-      container.scrollTo({ top: targetScroll, behavior: "smooth" });
+      const c = containerRef.current;
+      c.scrollTo({ top: el.offsetTop - c.clientHeight / 2 + el.offsetHeight / 2, behavior: "smooth" });
     }
-  }, [currentIdx, mode]);
+  }, [currentWordStart, mode]);
 
   // ── Progress ─────────────────────────────────────────────────────────────
   useEffect(() => {
     if (words.length > 1)
-      setProgress(Math.round((currentIdx / (words.length - 1)) * 100));
-  }, [currentIdx, words.length]);
+      setProgress(Math.round((currentWordEnd / (words.length - 1)) * 100));
+  }, [currentWordEnd, words.length]);
 
-  // ── Adaptive playback engine ─────────────────────────────────────────────
-  // IMPORTANT: scheduleNext must NEVER be called inside a setState updater,
-  // because React Strict Mode invokes updaters twice, causing exponential timeouts.
+  // ── Adaptive playback (variable timing, no side effects inside setState) ──
   useEffect(() => {
     if (!isPlaying) {
       if (timerRef.current) clearTimeout(timerRef.current);
       return;
     }
-
-    // `cancelled` flag ensures the old chain stops even if a timeout
-    // fires between effect teardown and the next Strict Mode re-mount.
     let cancelled = false;
 
     const scheduleNext = () => {
       if (cancelled || !isPlayingRef.current) return;
-
-      const idx   = currentIdxRef.current;
-      const delay = durationsRef.current[idx] ?? (60 / wpm) * 1000;
+      const idx   = currentChunkIdxRef.current;
+      const delay = chunkDurationsRef.current[idx] ?? (60 / wpm) * 1000;
 
       timerRef.current = setTimeout(() => {
         if (cancelled || !isPlayingRef.current) return;
-
-        const cur = currentIdxRef.current;
-        if (cur >= wordsLenRef.current - 1) {
+        const cur = currentChunkIdxRef.current;
+        if (cur >= chunksLenRef.current - 1) {
           setIsPlaying(false);
           return;
         }
-
-        // Advance word (pure state update — no side effects inside)
-        setCurrentIdx(cur + 1);
-        // Schedule next OUTSIDE of setState
+        setCurrentChunkIdx(cur + 1);
         scheduleNext();
       }, delay);
     };
@@ -137,27 +162,33 @@ export default function FocusReader() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isPlaying]);
 
-  // ── Speed ─────────────────────────────────────────────────────────────────
+  // ── Speed helpers ─────────────────────────────────────────────────────────
   const setSpeed = useCallback((val: number) => {
     const v = Math.min(MAX_WPM, Math.max(MIN_WPM, Math.round(val)));
     setWpm(v);
     setWpmInput(String(v));
   }, []);
 
-  // ── Keyboard shortcuts ────────────────────────────────────────────────────
+  // ── Jump to word ──────────────────────────────────────────────────────────
+  const jumpToWord = useCallback((wordIdx: number) => {
+    const clamped = Math.max(0, Math.min(words.length - 1, wordIdx));
+    setCurrentChunkIdx(findChunkForWord(chunks, clamped));
+  }, [words.length, chunks]);
+
+  // ── Keyboard ──────────────────────────────────────────────────────────────
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement).tagName === "INPUT") return;
-      if (e.code === "Space")       { e.preventDefault(); setIsPlaying((p) => !p); }
-      if (e.code === "ArrowUp")     { e.preventDefault(); setSpeed(wpm + 25); }
-      if (e.code === "ArrowDown")   { e.preventDefault(); setSpeed(wpm - 25); }
-      if (e.code === "ArrowRight")  setCurrentIdx((p) => Math.min(words.length - 1, p + 10));
-      if (e.code === "ArrowLeft")   setCurrentIdx((p) => Math.max(0, p - 10));
-      if (e.code === "Escape")      setShowChapters(false);
+      if (e.code === "Space")      { e.preventDefault(); setIsPlaying((p) => !p); }
+      if (e.code === "ArrowUp")    { e.preventDefault(); setSpeed(wpm + 25); }
+      if (e.code === "ArrowDown")  { e.preventDefault(); setSpeed(wpm - 25); }
+      if (e.code === "ArrowRight") jumpToWord(currentWordEnd + 10);
+      if (e.code === "ArrowLeft")  jumpToWord(currentWordStart - 10);
+      if (e.code === "Escape")     setShowChapters(false);
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [wpm, words.length, setSpeed]);
+  }, [wpm, currentWordStart, currentWordEnd, jumpToWord, setSpeed]);
 
   // ── File upload ───────────────────────────────────────────────────────────
   const handleFileUpload = useCallback(async (file: File) => {
@@ -167,12 +198,12 @@ export default function FocusReader() {
     setIsPlaying(false);
     setWords([]);
     setParagraphs([]);
+    setCurrentChunkIdx(0);
     setShowChapters(false);
     wordRefs.current = [];
 
     try {
       let result: { words: string[]; paragraphs: Paragraph[] };
-
       if (file.name.endsWith(".pdf")) {
         setLoadingMsg("Extrayendo texto del PDF…");
         result = await parsePdf(await file.arrayBuffer());
@@ -184,56 +215,60 @@ export default function FocusReader() {
         setLoadingMsg("Leyendo archivo…");
         result = buildParagraphsFromText((await file.text()).trim());
       }
-
       setWords(result.words);
       setParagraphs(result.paragraphs);
-      setCurrentIdx(0);
+      setCurrentChunkIdx(0);
       setProgress(0);
     } catch (err) {
       console.error(err);
-      const errMsg = err instanceof Error ? err.message : "Error desconocido";
-      const result = buildParagraphsFromText(`Error al leer el archivo: ${errMsg}`);
-      setWords(result.words);
-      setParagraphs(result.paragraphs);
+      const msg = err instanceof Error ? err.message : "Error desconocido";
+      const r = buildParagraphsFromText(`Error al leer el archivo: ${msg}`);
+      setWords(r.words);
+      setParagraphs(r.paragraphs);
     }
-
     setLoading(false);
   }, []);
 
-  const handleDrop = useCallback(
-    (e: React.DragEvent) => {
-      e.preventDefault();
-      const file = e.dataTransfer.files[0];
-      if (file) handleFileUpload(file);
-    },
-    [handleFileUpload]
-  );
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    const file = e.dataTransfer.files[0];
+    if (file) handleFileUpload(file);
+  }, [handleFileUpload]);
 
   const togglePlay = () => {
-    if (currentIdx >= words.length - 1) setCurrentIdx(0);
+    if (currentChunkIdx >= chunks.length - 1) setCurrentChunkIdx(0);
     setIsPlaying((p) => !p);
   };
 
-  const minutesLeft = Math.ceil((words.length - currentIdx) / wpm);
+  const minutesLeft = Math.ceil((words.length - currentWordEnd) / wpm);
 
   // ── Spritz render ─────────────────────────────────────────────────────────
   const renderSpritz = () => {
-    const word = words[currentIdx] || "";
-    const orp  = Math.max(1, Math.floor(word.length * 0.35));
+    const chunk  = chunks[currentChunkIdx];
+    if (!chunk) return null;
+    const chunkWords = words.slice(chunk.startIdx, chunk.endIdx + 1);
+    const isHeading  = paragraphs[currentParaIdx]?.type !== "body";
+
     return (
       <div className={styles.spritzReader}>
         {currentChapterLabel && (
           <div className={styles.spritzChapter}>📖 {currentChapterLabel}</div>
         )}
-        <div className={styles.spritzCard}>
-          <div className={styles.spritzWord}>
-            <span className={styles.spritzBefore}>{word.slice(0, orp)}</span>
-            <span className={styles.spritzOrp}>{word[orp] || ""}</span>
-            <span className={styles.spritzAfter}>{word.slice(orp + 1)}</span>
+        <div className={`${styles.spritzCard} ${isHeading ? styles.spritzHeadingCard : ""}`}>
+          <div className={styles.spritzChunk}>
+            {chunkWords.map((word, i) => (
+              <span key={i} className={`${styles.spritzChunkWord} ${isHeading ? styles.spritzHeadingWord : ""}`}>
+                {bionicMode
+                  ? <BionicWord word={word} />
+                  : word
+                }
+                {i < chunkWords.length - 1 ? "\u00a0" : ""}
+              </span>
+            ))}
           </div>
         </div>
         <div className={styles.spritzMeta}>
-          <span className={styles.spritzProgress}>{currentIdx + 1} / {words.length}</span>
+          <span className={styles.spritzProgress}>{currentWordEnd + 1} / {words.length}</span>
           <span>·</span>
           <span>{wpm} ppm</span>
           <span>·</span>
@@ -251,16 +286,13 @@ export default function FocusReader() {
         const paraWords = words.slice(para.startIdx, para.endIdx + 1);
         if (!paraWords.length) return null;
 
-        const isHeading = para.type !== "body";
-        const showBreak = (para.type === "h1" || para.type === "h2") && pIdx > 0;
-
-        const paraClass = [
+        const isHeading  = para.type !== "body";
+        const showBreak  = (para.type === "h1" || para.type === "h2") && pIdx > 0;
+        const paraClass  = [
           styles.paragraph,
           styles[para.type],
           isCurrentPara ? (isHeading ? styles.activePara : styles.active) : "",
-        ]
-          .filter(Boolean)
-          .join(" ");
+        ].filter(Boolean).join(" ");
 
         return (
           <Fragment key={pIdx}>
@@ -276,21 +308,29 @@ export default function FocusReader() {
               style={isHeading ? undefined : { fontSize: FONT_SIZE_VALUES[fontSizeIdx] }}
             >
               {paraWords.map((word, wOff) => {
-                const absIdx = para.startIdx + wOff;
-                const isCurrent = absIdx === currentIdx;
-                const isPast    = absIdx < currentIdx;
+                const absIdx   = para.startIdx + wOff;
+                const isActive = absIdx >= currentWordStart && absIdx <= currentWordEnd;
+                const isPast   = absIdx < currentWordStart;
+
                 return (
                   <span
                     key={absIdx}
                     ref={(el) => { wordRefs.current[absIdx] = el; }}
-                    onClick={() => { setCurrentIdx(absIdx); setIsPlaying(true); }}
+                    onClick={() => {
+                      const cIdx = findChunkForWord(chunks, absIdx);
+                      setCurrentChunkIdx(cIdx);
+                      setIsPlaying(true);
+                    }}
                     className={[
                       styles.word,
-                      isCurrent ? styles.current : "",
-                      isPast    ? styles.past    : "",
+                      isActive ? styles.current : "",
+                      isPast   ? styles.past    : "",
                     ].filter(Boolean).join(" ")}
                   >
-                    {word}{" "}
+                    {bionicMode && !isHeading
+                      ? <BionicWord word={word} />
+                      : word
+                    }{" "}
                   </span>
                 );
               })}
@@ -306,37 +346,20 @@ export default function FocusReader() {
     <div className={styles.chaptersPanel}>
       <div className={styles.chaptersPanelHeader}>
         <span>Capítulos</span>
-        <button
-          className={styles.chaptersPanelClose}
-          onClick={() => setShowChapters(false)}
-          aria-label="Cerrar panel de capítulos"
-        >
-          ✕
-        </button>
+        <button className={styles.chaptersPanelClose} onClick={() => setShowChapters(false)} aria-label="Cerrar">✕</button>
       </div>
       <div className={styles.chaptersList}>
         {chapters.map((ch, i) => {
           const label = words.slice(ch.startIdx, ch.endIdx + 1).join(" ");
           const isCurrent = ch.paraIdx === currentParaIdx ||
-            (currentParaIdx > ch.paraIdx &&
-              (i === chapters.length - 1 || currentParaIdx < chapters[i + 1]?.paraIdx));
+            (currentParaIdx > ch.paraIdx && (i === chapters.length - 1 || currentParaIdx < chapters[i + 1]?.paraIdx));
           return (
             <button
               key={i}
-              className={[
-                styles.chapterItem,
-                ch.type === "h1" ? styles.h1type : "",
-                isCurrent ? styles.currentChapterItem : "",
-              ].filter(Boolean).join(" ")}
-              onClick={() => {
-                setCurrentIdx(ch.startIdx);
-                setShowChapters(false);
-                setIsPlaying(false);
-              }}
+              className={[styles.chapterItem, ch.type === "h1" ? styles.h1type : "", isCurrent ? styles.currentChapterItem : ""].filter(Boolean).join(" ")}
+              onClick={() => { jumpToWord(ch.startIdx); setShowChapters(false); setIsPlaying(false); }}
             >
-              <span className={styles.chapterItemIcon}>
-                {ch.type === "h1" ? "H1" : "H2"}
-              </span>
+              <span className={styles.chapterItemIcon}>{ch.type === "h1" ? "H1" : "H2"}</span>
               <span className={styles.chapterItemText}>{label}</span>
             </button>
           );
@@ -362,48 +385,59 @@ export default function FocusReader() {
         <div className={styles.logo}>
           <div className={styles.logoIcon}>📖</div>
           <span className={styles.logoText}>FocusReader</span>
-          {fileName && (
-            <span className={styles.fileName} title={fileName}>{fileName}</span>
-          )}
+          {fileName && <span className={styles.fileName} title={fileName}>{fileName}</span>}
         </div>
 
         <div className={styles.controls}>
-          {/* Chapters button */}
+          {/* Chapters */}
           {words.length > 0 && chapters.length > 0 && (
-            <button
-              onClick={() => setShowChapters((s) => !s)}
-              className={`${styles.chaptersBtn} ${showChapters ? styles.open : ""}`}
-              aria-label="Ver capítulos"
-            >
+            <button onClick={() => setShowChapters((s) => !s)} className={`${styles.chaptersBtn} ${showChapters ? styles.open : ""}`}>
               ☰ {chapters.length} caps.
             </button>
           )}
 
           {/* Mode toggle */}
-          <div className={styles.segmented} role="group" aria-label="Modo de lectura">
+          <div className={styles.segmented}>
             {(["scroll", "spritz"] as const).map((m) => (
-              <button
-                key={m}
-                onClick={() => setMode(m)}
-                className={`${styles.segBtn} ${mode === m ? styles.active : styles.inactive}`}
-                aria-pressed={mode === m}
-              >
+              <button key={m} onClick={() => setMode(m)} className={`${styles.segBtn} ${mode === m ? styles.active : styles.inactive}`} aria-pressed={mode === m}>
                 {m === "scroll" ? "📜 Scroll" : "⚡ Spritz"}
               </button>
             ))}
           </div>
 
-          {/* Font size */}
+          {/* Chunk size */}
+          <div className={styles.fontSizeBtns} title="Palabras por grupo" style={{ gap: 3 }}>
+            {[1, 2, 3].map((n) => (
+              <button
+                key={n}
+                onClick={() => { setIsPlaying(false); setChunkSize(n); }}
+                className={`${styles.fontSizeBtn} ${chunkSize === n ? styles.active : styles.inactive}`}
+                title={`${n} ${n === 1 ? "palabra" : "palabras"} por grupo`}
+                aria-pressed={chunkSize === n}
+                style={{ width: 28 }}
+              >
+                ×{n}
+              </button>
+            ))}
+          </div>
+
+          {/* Bionic reading toggle */}
+          <button
+            onClick={() => setBionicMode((b) => !b)}
+            className={`${styles.iconBtn} ${bionicMode ? styles.bionicActive : ""}`}
+            title={bionicMode ? "Desactivar Bionic Reading" : "Activar Bionic Reading"}
+            aria-pressed={bionicMode}
+          >
+            <span style={{ fontWeight: 800, fontStyle: "italic", fontSize: "0.85rem" }}>B</span>
+          </button>
+
+          {/* Font size (scroll only) */}
           {mode === "scroll" && (
-            <div className={styles.fontSizeBtns} role="group" aria-label="Tamaño de fuente">
+            <div className={styles.fontSizeBtns}>
               {FONT_SIZE_LABELS.map((lbl, i) => (
-                <button
-                  key={i}
-                  onClick={() => setFontSizeIdx(i)}
+                <button key={i} onClick={() => setFontSizeIdx(i)}
                   className={`${styles.fontSizeBtn} ${fontSizeIdx === i ? styles.active : styles.inactive}`}
-                  aria-label={`Fuente tamaño ${lbl}`}
-                  aria-pressed={fontSizeIdx === i}
-                >
+                  aria-label={`Fuente ${lbl}`} aria-pressed={fontSizeIdx === i}>
                   {lbl}
                 </button>
               ))}
@@ -411,29 +445,16 @@ export default function FocusReader() {
           )}
 
           {/* Dark mode */}
-          <button
-            onClick={() => setDarkMode((d) => !d)}
-            className={styles.iconBtn}
-            aria-label={darkMode ? "Modo claro" : "Modo oscuro"}
-          >
+          <button onClick={() => setDarkMode((d) => !d)} className={styles.iconBtn} aria-label={darkMode ? "Modo claro" : "Modo oscuro"}>
             {darkMode ? "☀️" : "🌙"}
           </button>
 
           {/* Upload */}
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            className={styles.uploadBtn}
-            aria-label="Subir archivo"
-          >
+          <button onClick={() => fileInputRef.current?.click()} className={styles.uploadBtn}>
             <span>+</span> Subir
           </button>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".pdf,.epub,.txt"
-            style={{ display: "none" }}
-            onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0])}
-          />
+          <input ref={fileInputRef} type="file" accept=".pdf,.epub,.txt" style={{ display: "none" }}
+            onChange={(e) => e.target.files?.[0] && handleFileUpload(e.target.files[0])} />
         </div>
       </header>
 
@@ -444,7 +465,7 @@ export default function FocusReader() {
         </div>
       )}
 
-      {/* ── Main content ── */}
+      {/* ── Main ── */}
       <main className={styles.main}>
         {loading && (
           <div className={styles.loading}>
@@ -457,27 +478,17 @@ export default function FocusReader() {
           <div className={styles.emptyState}>
             <div className={styles.emptyIcon}>📄</div>
             <h1 className={styles.emptyTitle}>Sube un archivo para comenzar</h1>
-            <p className={styles.emptyDesc}>
-              FocusReader resalta cada palabra mientras avanzas,<br />
-              manteniendo tu atención en la lectura.
-            </p>
+            <p className={styles.emptyDesc}>FocusReader resalta cada palabra mientras avanzas,<br />manteniendo tu atención en la lectura.</p>
             <div className={styles.emptyFormats}>
               <span className={styles.badge}>PDF</span>
               <span className={styles.badge}>EPUB</span>
               <span className={styles.badge}>TXT</span>
             </div>
-            <div className={styles.emptyDrop}>
-              <span>🖱️</span>
-              <span>Arrastra tu archivo aquí</span>
-            </div>
+            <div className={styles.emptyDrop}><span>🖱️</span><span>Arrastra tu archivo aquí</span></div>
           </div>
         )}
 
-        {!loading && words.length > 0 && (
-          mode === "scroll" ? renderScroll() : renderSpritz()
-        )}
-
-        {/* Chapters panel overlay */}
+        {!loading && words.length > 0 && (mode === "scroll" ? renderScroll() : renderSpritz())}
         {showChapters && renderChaptersPanel()}
       </main>
 
@@ -485,35 +496,31 @@ export default function FocusReader() {
       {words.length > 0 && !loading && (
         <div className={styles.controlsBar}>
           <div className={styles.playbackGroup}>
-            <button onClick={() => { setIsPlaying(false); setCurrentIdx(0); }} className={styles.ctrlBtn} aria-label="Reiniciar">⏮</button>
-            <button onClick={() => setCurrentIdx((p) => Math.max(0, p - 20))} className={styles.ctrlBtn} aria-label="−20 palabras">⏪</button>
+            <button onClick={() => { setIsPlaying(false); setCurrentChunkIdx(0); }} className={styles.ctrlBtn} aria-label="Reiniciar">⏮</button>
+            <button onClick={() => jumpToWord(currentWordStart - 20)} className={styles.ctrlBtn} aria-label="−20">⏪</button>
             <button onClick={togglePlay} className={`${styles.playBtn} ${isPlaying ? styles.playing : ""}`} aria-label={isPlaying ? "Pausar" : "Reproducir"}>
               {isPlaying ? "⏸" : "▶"}
             </button>
-            <button onClick={() => setCurrentIdx((p) => Math.min(words.length - 1, p + 20))} className={styles.ctrlBtn} aria-label="+20 palabras">⏩</button>
+            <button onClick={() => jumpToWord(currentWordEnd + 20)} className={styles.ctrlBtn} aria-label="+20">⏩</button>
           </div>
 
           <div className={styles.speedGroup}>
             <span className={styles.speedLabel}>Velocidad</span>
-            <button onClick={() => setSpeed(wpm - 25)} className={styles.speedAdjBtn} aria-label="Reducir">−</button>
+            <button onClick={() => setSpeed(wpm - 25)} className={styles.speedAdjBtn}>−</button>
             <div className={styles.wpmInputWrap}>
-              <input
-                type="number" min={MIN_WPM} max={MAX_WPM}
-                value={wpmInput}
+              <input type="number" min={MIN_WPM} max={MAX_WPM} value={wpmInput}
                 onChange={(e) => setWpmInput(e.target.value)}
                 onBlur={(e) => setSpeed(Number(e.target.value))}
                 onKeyDown={(e) => { if (e.key === "Enter") setSpeed(Number(wpmInput)); }}
-                className={styles.wpmInput}
-                aria-label="Palabras por minuto"
-              />
+                className={styles.wpmInput} aria-label="PPM" />
               <span className={styles.wpmUnit}>ppm</span>
             </div>
-            <button onClick={() => setSpeed(wpm + 25)} className={styles.speedAdjBtn} aria-label="Aumentar">+</button>
+            <button onClick={() => setSpeed(wpm + 25)} className={styles.speedAdjBtn}>+</button>
             <div className={styles.kbHint}><span className={styles.kbKey}>↑↓</span></div>
           </div>
 
           <div className={styles.statsGroup}>
-            <div>{currentIdx + 1} / {words.length} palabras</div>
+            <div>{currentWordEnd + 1} / {words.length} palabras</div>
             <div>~<span className={styles.statsTime}>{minutesLeft} min</span> restantes</div>
           </div>
         </div>
